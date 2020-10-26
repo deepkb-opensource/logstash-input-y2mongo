@@ -1,0 +1,17 @@
+# Ignore Gradle project-specific cache directory
+.gradle
+.setting
+.classpath
+.gitattributes
+.project
+.settings/
+# Ignore Gradle build output directory
+build
+bin
+lib
+vendor
+build.gradle.default
+.idea/
+screens/gradle_project_eclipse.png
+gem.bat
+gem-install.bat
