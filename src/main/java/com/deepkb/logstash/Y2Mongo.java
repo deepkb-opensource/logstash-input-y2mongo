@@ -1,129 +1,131 @@
+/**
+ * Source Code is under Apache License Version 2.0, refer to LICENSE file located under project root directory
+ * Contributed By  : Y2 Consulting Inc. (https://deepkb.com)
+ */
 package com.deepkb.logstash;
 
 import co.elastic.logstash.api.*;
-import com.mongodb.MongoClient;
-import com.mongodb.MongoClientURI;
-import com.mongodb.client.MongoCollection;
-import com.mongodb.client.MongoCursor;
-import com.mongodb.client.MongoDatabase;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.bson.BsonArray;
-import org.bson.BsonDocument;
-import org.bson.BsonValue;
-import org.bson.Document;
-import org.bson.conversions.Bson;
-import org.bson.types.ObjectId;
+import org.quartz.*;
+import org.quartz.impl.StdSchedulerFactory;
 
-import java.util.*;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.function.Consumer;
 
+import static org.quartz.CronScheduleBuilder.cronSchedule;
+import static org.quartz.JobBuilder.newJob;
+import static org.quartz.TriggerBuilder.newTrigger;
+
+/**
+ * Import from MongoDB Pipeline Implementation
+ * Execute query or aggregate against a MongoDB database and inject the records into the logstash pipeline
+ * Configurations:
+ *  connection_string : mongodb connections string, Eg: mongodb://localhost:27017 , if authentication needed, put it in the connection string
+ *  database : name of database
+ *  collection : name of collection
+ *  query : query string
+ *  aggregate : aggregate string
+ *  schedule : cron like scheduler, syntax please refer to http://www.quartz-scheduler.org/documentation/quartz-2.3.0/tutorials/crontrigger.html
+ *
+ */
 @LogstashPlugin(name = "y2mongo")
 public class Y2Mongo implements Input {
-    final static Logger logger = LogManager.getLogger("y2mongo");
+    final static Logger log = LogManager.getLogger("y2mongo");
     public static final PluginConfigSpec<String> CONFIG_CONNECTION_STRING = PluginConfigSpec.stringSetting("connection_string", "mongodb://localhost:27017", false, true);
     public static final PluginConfigSpec<String> CONFIG_DATABASE = PluginConfigSpec.stringSetting("database", "", false, true);
     public static final PluginConfigSpec<String> CONFIG_COLLECTION = PluginConfigSpec.stringSetting("collection", "", false, false);
     public static final PluginConfigSpec<String> CONFIG_QUERY = PluginConfigSpec.stringSetting("query", "", false, false);
     public static final PluginConfigSpec<String> CONFIG_AGGREGATE = PluginConfigSpec.stringSetting("aggregate", "", false, false);
+    public static final PluginConfigSpec<String> CONFIG_SCHEDULE = PluginConfigSpec.stringSetting("schedule", "", false, false);
 
     private String id;
-    private String connectionString;
-    private String databaseName;
-    private String collectionName;
-    private String query;
-    private String aggregate;
+    private Configuration config;
     private final CountDownLatch done = new CountDownLatch(1);
     private volatile boolean stopped;
 
     public Y2Mongo(String id, Configuration config, Context context) {
         this.id = id;
-        connectionString = config.get(CONFIG_CONNECTION_STRING);
-        databaseName = config.get(CONFIG_DATABASE);
-        collectionName = config.get(CONFIG_COLLECTION);
-        query = config.get(CONFIG_QUERY);
-        aggregate = config.get(CONFIG_AGGREGATE);
-    }
-
-    static void convertDocument(Document doc, Map map) {
-        for (Map.Entry<String, Object> entry : doc.entrySet()) {
-            String key = entry.getKey();
-            Object value = entry.getValue();
-            if (value == null) {
-                map.put(key, null);
-                continue;
-            }
-            if (value instanceof ObjectId) {
-                map.put(key, ((ObjectId) value).toString());
-            } else if (value instanceof Document) {
-                Map map1 = new LinkedHashMap();
-                convertDocument((Document) value, map1);
-                map.put(key, map1);
-            } else {
-                map.put(key, value);
-            }
-        }
+        this.config = config;
     }
 
     @Override
     public void start(Consumer<Map<String, Object>> consumer) {
-        MongoClient mongoClient = null;
-        MongoCursor<Document> cursor = null;
         try {
-            MongoClientURI clientURI = new MongoClientURI(connectionString);
-            mongoClient = new MongoClient(clientURI);
-            MongoDatabase mongoDatabase = mongoClient.getDatabase(databaseName);
-            MongoCollection<Document> collection = mongoDatabase.getCollection(collectionName);
-            if (StringUtils.isNotEmpty(query)) {
-                cursor = collection.find(BsonDocument.parse(query)).iterator();
-            } else if (StringUtils.isNotEmpty(aggregate)) {
-                Iterator<BsonValue> aggItr = BsonArray.parse(aggregate).getValues().iterator();
-                List<BsonDocument> aggrList = new ArrayList<>();
-                while (aggItr.hasNext()) {
-                    BsonValue bsonValue = aggItr.next();
-                    if (bsonValue instanceof  BsonDocument) {
-                        aggrList.add((BsonDocument) bsonValue);
-                    }
+            String cron = config.get(CONFIG_SCHEDULE);
+            if (StringUtils.isEmpty(cron)) {
+                //No scheduler defined
+                MongoInputJob mongoInputJob = new MongoInputJob();
+                mongoInputJob.execute(this, consumer);
+                return;
+            }
+            SchedulerFactory schedulerFactory = new StdSchedulerFactory();
+            Scheduler scheduler = schedulerFactory.getScheduler();
+            JobDetail job = newJob(MongoInputJob.class)
+                    .withIdentity("MongoInputJob", "MongoInputJobGroup")
+                    .build();
+
+            CronTrigger trigger = newTrigger()
+                    .withIdentity("MongoInputTrigger", "MongoInputJobGroup")
+                    .withSchedule(cronSchedule(cron))
+                    .startNow()
+                    .build();
+
+            //Add listener to trace
+            scheduler.getListenerManager().addJobListener(new InputJobListener());
+
+            scheduler.scheduleJob(job, trigger);
+            scheduler.getContext().put("y2mongo", this);
+            scheduler.getContext().put("consumer", consumer);
+            scheduler.start();
+            log.info("Mongo Input Job Scheduled ... " + trigger.getCronExpression());
+            log.info("============================================================");
+            log.info("Cron Job Summary ");
+            log.info(trigger.getExpressionSummary());
+            log.info("============================================================");
+            log.info("Next fire time " + trigger.getNextFireTime());
+            while (!stopped) {
+                //Just sleep, nothing to do.
+                try {
+                    Thread.sleep(5000);
+                } catch (InterruptedException ie) {
+                    log.error("Error Y2Mongo ", ie);
                 }
-                cursor = collection.aggregate(aggrList).iterator();
-            } else {
-                cursor = collection.find().iterator();
             }
-            int eventCount = 0;
-            while (!stopped && cursor.hasNext() && eventCount < 5) {
-                Document doc = cursor.next();
-                Map map = new LinkedHashMap<String, Object>();
-                convertDocument(doc, map);
-                consumer.accept(map);
-                eventCount++;
-            }
-        } catch (Exception ex) {
-            logger.error("Error process mongodb collection", ex);
+        } catch (SchedulerException ex) {
+            log.error("Error Y2Mongo ", ex);
         } finally {
             stopped = true;
             done.countDown();
-            if (cursor != null) {
-                cursor.close();
-            }
-            mongoClient.close();
         }
+    }
+
+    public boolean isStopped() {
+        return stopped;
+    }
+
+    public Configuration getConfig() {
+        return config;
     }
 
     @Override
     public void stop() {
-        stopped = true; // set flag to request cooperative stop of input
+        stopped = true;
     }
 
     @Override
     public void awaitStop() throws InterruptedException {
-        done.await(); // blocks until input has stopped
+        done.await();
     }
 
     @Override
     public Collection<PluginConfigSpec<?>> configSchema() {
-        return Arrays.asList(CONFIG_CONNECTION_STRING, CONFIG_DATABASE, CONFIG_COLLECTION, CONFIG_QUERY, CONFIG_AGGREGATE);
+        return Arrays.asList(CONFIG_CONNECTION_STRING, CONFIG_DATABASE, CONFIG_COLLECTION, CONFIG_QUERY,
+                CONFIG_AGGREGATE, CONFIG_SCHEDULE);
     }
 
     @Override

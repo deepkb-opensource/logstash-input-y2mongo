@@ -55,6 +55,7 @@ shadowJar {
 dependencies {
     compile 'org.mongodb:mongo-java-driver:3.12.7'
     compile 'org.mongodb:bson:4.1.1'
+    compile 'org.quartz-scheduler:quartz:2.3.2'
     compile 'org.apache.commons:commons-lang3:3.11'
     compile 'org.apache.logging.log4j:log4j-api:2.13.2'
     compile 'org.apache.logging.log4j:log4j-core:2.13.2'
@@ -108,6 +109,12 @@ task removeObsoleteJars() {
 }
 
 task gem(dependsOn: [downloadAndInstallJRuby, removeObsoleteJars, vendor, generateRubySupportFiles]) {
+    doLast {
+        buildGem(projectDir, buildDir, pluginInfo.pluginFullName() + ".gemspec")
+    }
+}
+
+task gem1(dependsOn: [removeObsoleteJars, vendor, generateRubySupportFiles]) {
     doLast {
         buildGem(projectDir, buildDir, pluginInfo.pluginFullName() + ".gemspec")
     }
